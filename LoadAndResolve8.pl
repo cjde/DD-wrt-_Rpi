@@ -1,0 +1,559 @@
+#!/usr/bin/perl
+# This script take the dnslog that has been uploaded and builds a look up hostnames by Ip address. 
+# it hast to realy look at hte dnslog file because there are several sceanerios that need attention
+# They are  
+#
+# 1) local lookup 
+#Oct 18 20:01:01 dnsmasq[5856]: query[A] peetapi from 192.168.2.30
+#Oct 18 20:01:01 dnsmasq[5856]: /etc/hosts peetapi is 192.168.2.30
+#
+# 2) DHCP 
+# Oct 18 20:01:55 dnsmasq-dhcp[5856]: DHCPREQUEST(br0) 192.168.2.30 b8:27:eb:81:53:06 
+# Oct 18 20:01:55 dnsmasq-dhcp[5856]: DHCPACK(br0) 192.168.2.30 b8:27:eb:81:53:06 peetapi
+#
+# 3)  Cached name 
+#Oct 18 20:02:16 dnsmasq[5856]: query[A] ad.tanzuki.net from 192.168.2.5
+#Oct 18 20:02:16 dnsmasq[5856]: cached ad.tanzuki.net is <CNAME>
+#Oct 18 20:02:16 dnsmasq[5856]: forwarded ad.tanzuki.net to 8.8.8.8
+#Oct 18 20:02:16 dnsmasq[5856]: reply tanzuki-1967770324.us-west-2.elb.amazonaws.com is 50.112.95.0
+#Oct 18 20:02:16 dnsmasq[5856]: reply tanzuki-1967770324.us-west-2.elb.amazonaws.com is 50.112.111.203
+#Oct 18 20:02:16 dnsmasq[5856]: reply tanzuki-1967770324.us-west-2.elb.amazonaws.com is 50.112.253.26
+#
+# 4) Not cached 
+#Oct 18 20:30:49 dnsmasq[5856]: query[A] webservices.continental.com from 192.168.2.10
+#Oct 18 20:30:49 dnsmasq[5856]: forwarded webservices.continental.com to 8.8.8.8
+#Oct 18 20:30:49 dnsmasq[5856]: reply webservices.continental.com is 216.136.1.38
+#Oct 18 20:30:49 dnsmasq[5856]: reply webservices.continental.com is 12.169.195.38
+#
+# 5) Server? 
+#Oct 18 20:21:00 dnsmasq[5856]: query[SRV] _ldap._tcp.Core-Site-DCC._sites.ldap.hp.com from 192.168.2.13
+#Oct 18 20:21:00 dnsmasq[5856]: forwarded _ldap._tcp.Core-Site-DCC._sites.ldap.hp.com to 8.8.8.8
+#
+# 6) IPV6 queries 
+#Oct 18 20:02:16 dnsmasq[5856]: query[AAAA] ???? 
+#Oct 18 20:02:16 dnsmasq[5856]: cached ad.tanzuki.net is <CNAME>
+#
+# 7) Cached Ip address  
+#Oct 19 23:04:01 dnsmasq[5856]: query[A] apple.com from 192.168.2.27
+#Oct 19 23:04:01 dnsmasq[5856]: cached apple.com is 17.149.160.49
+#Oct 19 23:04:01 dnsmasq[5856]: cached apple.com is 17.172.224.47
+#Oct 19 23:04:01 dnsmasq[5856]: cached apple.com is 17.178.96.59
+#
+# 8) Not an address returned as a reply 
+#Oct 20 21:25:55 dnsmasq[5856]: query[A] wpad.americas.hpqcorp.net from 192.168.2.13
+#Oct 20 21:25:55 dnsmasq[5856]: forwarded wpad.americas.hpqcorp.net to 8.8.8.8
+#Oct 20 21:25:55 dnsmasq[5856]: reply wpad.americas.hpqcorp.net is NXDOMAIN-IPv4
+#or
+#Oct 24 11:32:59 dnsmasq[5856]: reply mediaserver-sv5-t2-1.pandora.com is NODATA-IPv6
+
+#
+# Essentially we are looking to start with a query[A] and then link all the replied addresses to this name 
+# until another query is encountered. There are also the following that need special treatment
+
+# Revers lookups 
+#
+#Oct 23 23:19:07 dnsmasq[5856]: query[PTR] 116.37.194.173.in-addr.arpa from 192.168.2.18
+#Oct 23 23:19:07 dnsmasq[5856]: forwarded 116.37.194.173.in-addr.arpa to 8.8.8.8
+#Oct 23 23:19:07 dnsmasq[5856]: reply 173.194.37.116 is mia05s17-in-f20.1e100.net
+#
+# Local IP addresses !!!
+#Oct 24 11:09:37 dnsmasq-dhcp[5856]: DHCPACK(br0) 192.168.2.22 f4:ce:46:5f:23:47 printer
+#Oct 24 11:13:33 dnsmasq-dhcp[5856]: DHCPACK(br0) 192.168.2.6 00:1d:fe:df:0e:b7 jtouchpad
+
+#Oct 18 20:30:49 dnsmasq[5856]: reply webservices.continental.com is 12.169.195.38
+#Oct 23 23:19:07 dnsmasq[5856]: reply 173.194.37.116 is mia05s17-in-f20.1e100.net
+
+use strict;
+use warnings;
+use Data::Dumper;
+use Time::Local;
+
+# CONTRACK_RAW=/tmp/ipconntrack.raw
+# CONTRACK_COOKED=/tmp/ipconntrack.out
+my $dir   = '/tmp';
+
+# place to save and reload the work that we have done 
+my $namefile = "/var/tmp/resolve.out";
+
+# this hash is indexed by the IP and contains 
+# 1) name - the host name for that iP
+# 2) from - the local address that made the request ( if known ) 
+# 3) at   - timestamp when the last the request was made 
+# 4) cnt  - count of how many times it was requested 
+my %NAMES = ();
+
+# this hash indexed by the name of the host and contains the 
+# address the got dug out of the dumped dnsmasq cache  
+my %IPS = ();
+
+my %QUERYS = ();
+# just to convert months to numbers 
+my %mon2num = qw(
+    Jan 0  Feb 1  Mar 2  Apr 3  May 4  Jun 5
+    Jul 6  Aug 7  Sep 8  Oct 9  Nov 10 Dec 11 );
+
+# get the year 	
+my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+
+# what is our IP ... need it to filter out our own DNS requests
+my $myip = "192.168.2.8";
+
+#Time that hte file is read and approximate current time 
+my $timestamp;
+
+# this is the number of seconds in 12 hours and is used as the divisor in 
+# the Purge Function to derive thew number of 1/2 days that have elapsed 
+# since a IP had been accessed.  
+my $pruneconst = 12*3600;
+
+
+sub  LoadNames{  
+# Apparently different local systems can make name lookups and get the same IP  
+# for different names. If a request is made from one local host after the session 
+# is already started from another then the name associated with the new session 
+# is used in the old session to... This was by design but causes issues in reporting
+# because the last on to request that IP is the name use on both reports. 
+# 
+# Therefore each ip/name combination pulled out of the file needs to also be associated 
+# with the requesting local host. It also will be tagged with the date of the request 
+# so that 1) it can be purged if real old and 2) reports can be generated as to what hosts made 
+# which requests at what time... 
+#
+# to do 
+# 1) LoadNames in the query needs to parse the time of the request 
+#    (Dec 18 18:40:27 dnsmasq[8675]: query[A] imap.gmail.com from 192.168.2.27)
+# 2) the data structure needs to add requester as an additional key into the name 
+# 3) the time of that request needs to be saved too
+# 4) count field showing the number of times this has been accessed  
+#
+# 5)resolve function needs to pass in the IP and the name of the requesting local host 
+#   I'm not sure if one local host making a address query ill return a ip address that is different 
+#   from another local host making the same request minutes late ... not sure it matters ..
+#
+# 6) savenames need to save the name/ip/requestor/time of the query 
+# 
+# 7) trimnames need to be written that goes thru the data and removes old entries from the hash 
+# 
+
+	my $file = "$dir/dnslog.raw";
+
+	my $debugfilename = "$dir/dnslog.out";
+	
+	# this hash is a mapping of queried names to the host address that made the query
+	# is used later to verify that all the names that are queried get resolved 
+
+	
+	# load up the hash if it is empty
+	if (( keys %NAMES) < 1 ) {
+	    print "Reloading name cache...\n";
+		Reload();
+	}
+
+	# open the dsnlog file that has all the dns queries 
+	open my $dnslog, $file or die "Could not open $file: $! Please touch it or make it.";
+
+	# when was it created ?
+	$timestamp = (stat($file))[9];
+
+	# an the log  file for debug 
+	 open DBGFILE, ">>", $debugfilename or die "Error opening log file $debugfilename: $!";
+
+	#print  " --------- $timestamp ", scalar localtime( $timestamp ), "---------\n";
+	print  DBGFILE " --------- $timestamp ", scalar localtime( $timestamp ), "---------\n";
+
+
+	my $name;
+	my $line; 
+	my $ip;
+	my $reqtime;
+
+	
+	#read the ip_connecions file and look for queries and the cache dump
+	while( my $line = <$dnslog>)  {
+		#print $line; 
+		chomp $line;
+		
+			
+		# so what do we have ? 
+
+		# is this a IPV4 query from a local host? BTW we ignore IPV6  
+		#  1   2  3  4  5                           6                             7  
+ 		# Dec 18 17:20:49 dnsmasq[8675]: query[A] eqv-8.eqv-rtb1.rfihub.net from 192.168.2.6
+        #                   1      2     3     4     5                           6            7
+		if ( $line =~ m/(\S+)\s+(\d+)\s+(\d+):(\d+):(\d+)\sdnsmasq.*: query.A.\s+(\S+)\s+from\s(\S+)/ )  {
+
+			# figure out when this query was made 
+			# convert to epoch time, use the year that we got earlier 
+			$mon  = $mon2num{$1};
+			$mday = $2;
+			$hour = $3; 
+			$min  = $4;
+			$sec  = $5;
+			$reqtime = timelocal($sec,$min,$hour,$mday,$mon,$year);
+			
+			#got a name ...  
+			my $query=$6;
+
+			#what local IP requested it ?
+			my $fromip=$7;
+			
+			# ya know we may want to avoid pulling in the queries that were initiated by this script 
+			# those are the ones where $fromip = IP address of this RasberryPi 
+			if ( $fromip ne $myip ) {		
+				# save it for later, after the local cache is updated we will have to make 
+				# the DNS requests for any that we don't find in the cache 
+				$QUERYS{$query}{from} = $fromip;
+				$QUERYS{$query}{at} = $reqtime;
+				#print DBGFILE "got query for query: $query from: $fromip at: $reqtime\n";
+			}
+			else { 
+				#print DBGFILE "skipping query from this host: $fromip\n";
+			}
+		}
+		# ok so... is this a line from the lines of the dumped cached 
+		#  1   2  3  4  5                6                             7      **anchor**  
+		# Jan  1 18:05:58 dnsmasq[6309]: boards.hgtv.com     199.255.147.10      4F         Wed Jan  1 19:45:04 2014
+		#                    1      2      3     4     5                 6       7     *a*
+		elsif ( $line  =~ /(\S+)\s+(\d+)\s+(\d+):(\d+):(\d+)\sdnsmasq.*: (\S+)\s+(\S+)\s+4F/ ) { 
+			# convert to epoch time, use the year that we got earlier 
+			print DBGFILE "Cache line $line";
+			$mon  = $mon2num{$1};
+			$mday = $2;
+			$hour = $3; 
+			$min  = $4;
+			$sec  = $5;
+			$reqtime = timelocal($sec,$min,$hour,$mday,$mon,$year);
+			
+			$name =$6;
+ 			$ip = $7; 
+
+			# is this a good Ip address ? 
+			if ($ip =~ /\b(\d{1,3}(?:\.\d{1,3}){3})\b/){
+				# Good IP! add the name and IP to the cache 
+				# is it already here ? 
+				if ( ! exists $NAMES{$ip} ) {
+					$NAMES{$ip}{name} = $name;
+					$NAMES{$ip}{at} = $reqtime;
+					$NAMES{$ip}{cnt} = 0;
+					# this is fronm the cache dump so we dont really know who made the request
+					$NAMES{$ip}{from} = "CACHE";
+					# add it to the forward map
+					$IPS{$name}=$ip;
+				}
+				else {				
+					# Old news. Seen this address/name before. We dont need to update it 
+					# because it is just from the cache and the time/requestor is 
+					# undeterminable at this point
+				}
+			}
+			else { 
+				print DBGFILE  "In dumped cache section $ip - IS NOT A ADDRESS-> $line\n";
+			}
+
+		}
+		# ok .. not IPV4 query, Not a Cache line ... maybe a DHCP? 
+		# 1   2  3  4  5                                    6                7           8
+		#Oct 24 11:13:33 dnsmasq-dhcp[5856]: DHCPACK(br0) 192.168.2.6 00:1d:fe:df:0e:b7 touchpad
+		# local DHCP requests!! 
+		#                    1      2      3     4     5                                   6       7        8
+		elsif ( $line  =~ /(\S+)\s+(\d+)\s+(\d+):(\d+):(\d+)\sdnsmasq-dhcp.*: DHCPACK\S+\s+(\S+)\s+(\S+)\s+(\S+)/ ) {
+			# convert to epoch time, use the year that we got earlier 
+			$mon  = $mon2num{$1};
+			$mday = $2;
+			$hour = $3; 
+			$min  = $4;
+			$sec  = $5;
+			$reqtime = timelocal($sec,$min,$hour,$mday,$mon,$year);
+			$ip = $6;
+			my $mac = $7;
+			$name = $8;
+			# is this a good IP address ? 
+			if ($ip =~ /\b(\d{1,3}(?:\.\d{1,3}){3})\b/){
+				# Good IP! add the name and IP to the cache if it is not there 
+				# These are local addresses and should really be here most of the time
+				if ( ! exists $NAMES{$ip} ) {
+					$NAMES{$ip}{name} = $name;
+					$NAMES{$ip}{at} = $reqtime;
+					$NAMES{$ip}{from} = "DHCP";
+					$NAMES{$ip}{cnt} = 0;
+					# and the forward map
+					$IPS{$name}=$ip;
+				}
+			}
+			else {
+				print DBGFILE  "in DHCPACK $ip - IS NOT A ADDRESS-> $line\n";
+			}
+		}
+		# AHA  a reply from a name server !!! cache it 
+		# 1   2  3  4  5                                 6                           7
+		#Oct 18 20:30:49 dnsmasq[5856]: reply    webservices.continental.com is 12.169.195.38
+		#Oct 23 23:03:23 dnsmasq[5856]: reply    hpqroot.americas.hpqcorp.net is NXDOMAIN-IPv4
+		#Oct 23 23:19:07 dnsmasq[5856]: reply    173.194.37.116              is mia05s17-in-f20.1e100.net
+		#Feb  9 22:11:02 dnsmasq[2850]: /etc/hosts  peetapi               is 192.168.2.30
+		
+		#                    1      2      3     4      5             6               7        
+		elsif ( $line  =~ /(\S+)\s+(\d+)\s+(\d+):(\d+):(\d+).*reply\s+(\S+)\s+is\s+(\S+)/ or 
+				$line  =~ /(\S+)\s+(\d+)\s+(\d+):(\d+):(\d+).*etc.hosts\s+(\S+)\s+is\s+(\S+)/ )	{
+
+			# convert to epoch time, use the year that we got earlier 
+			$mon  = $mon2num{$1};
+			$mday = $2;
+			$hour = $3; 
+			$min  = $4;
+			$sec  = $5;
+			$reqtime = timelocal($sec,$min,$hour,$mday,$mon,$year);
+			my $thing1 = $6;
+			my $thing2 = $7;
+			my $ip = ""; 
+			# is thing1 an address ? 
+			if ($thing1 =~ /\b(\d{1,3}(?:\.\d{1,3}){3})\b/){
+			   $ip = $thing1;
+			   $name = $thing2;
+			}
+			# ok is thing 2 an address ? 
+			elsif ($thing2 =~ /\b(\d{1,3}(?:\.\d{1,3}){3})\b/){
+			   $ip = $thing2;
+			   $name = $thing1;
+			}
+			# if one of those things was a IP then save it 
+			if ( $ip ne "" ){
+				#print DBGFILE "got reply for name: $name is $ip at: $reqtime\n";
+				# have we already saved this reply earlier? 
+				if ( ! exists $NAMES{$ip} ) {
+					$NAMES{$ip}{name} = $name;
+					$NAMES{$ip}{at} = $reqtime;
+					$NAMES{$ip}{from} = "REPLY";
+					$NAMES{$ip}{cnt} = 0;
+					# and the forward map
+					$IPS{$name}=$ip;
+				}
+				# we could remove this name from the query list by checking if 
+				# the name is already on the list ( QUERY{name} ) and then 
+				# deleting the hash entry. But instead we will look for the queried name AFTER
+				# we have saved all the query and can match them up with all the replies 
+			}
+			else {
+				print DBGFILE  "In reply cant find a  IP address -> $line\n";
+				#print "In reply cant find a 1: $thing1 2: $thing2 IP address \n -> $line\n";
+			}
+		}
+	}
+	# print "NAMES\n";
+	# print Dumper( \%NAMES );
+	# print "IPS\n";
+	# print Dumper( \%IPS ); 
+	# print "QUERYS\n";
+	# print Dumper( \%QUERYS ); 
+
+	
+	# Done reading the dump from dnsmasq.. .we picked up the dumped cache and built the 
+	# local cache, so now lets see if all the queries that were also found in the file 
+	# were resolved. The dumped cache may have had CNAMES in it but they are ignored  
+		
+	foreach my $query (sort keys %QUERYS) {
+		# does this queried name exist in the cache  
+		if ( exists $IPS{$query} ) {
+			# ok it is here, get the IP for the name 
+			#print DBGFILE "Cache hit for query: $query\n";
+			my $ip = $IPS{$query};
+
+			# now update the ip to name cache with who made the request and when
+			$NAMES{$ip}{name} = $query;
+			$NAMES{$ip}{from} = $QUERYS{$query}{from}; 
+			$NAMES{$ip}{at}   = $QUERYS{$query}{at};
+			$NAMES{$ip}{cnt} ++; 
+		}
+		else { 
+			# Name from the query is not in the cache or is was a CNAME
+			# Get the IPs for the queried name with at call to dig ! 
+			
+			my @out = qx (/usr/bin/dig $query +short); 
+			print DBGFILE "Dig query for $query returned $#out \n"; 
+			if ( $#out >=  0 ){ 
+				# fill in the cache with the all the returned IPs referencing the same query name 
+				# this way we can avoid the akamai cname references ( which really mean nothing for the report )
+				foreach my $ipfromdig (@out) { 
+					chomp $ipfromdig;
+					print DBGFILE "$ipfromdig \n";
+					chomp $ipfromdig; 
+					#is it a IP or a cname name ?
+					if ($ipfromdig =~ /\b(\d{1,3}(?:\.\d{1,3}){3})\b/){
+						# its a address! so save all the IPs that we get as the name that we got in the query 
+
+						$NAMES{$ipfromdig}{name} = $query;
+						$NAMES{$ipfromdig}{at}   = $QUERYS{$query}{at}; 
+						$NAMES{$ipfromdig}{from} = $QUERYS{$query}{from} ;
+						$NAMES{$ipfromdig}{cnt}  = 0;
+						# update the forward map
+						$IPS{$query}=$ipfromdig;
+					}
+					else {
+						#print DBGFILE "Skipping CNAME: $ipfromdig for query: $query \n";
+					}
+				}
+			}
+			else { 
+				# we got a query but no address was found for it... must have been a typo'ed query
+				 print DBGFILE "Cant dig for $query \n";
+			}
+		}
+	}
+
+	#Just in case we have to restart save the names  that we have already loaded up
+	print "Saving name cache \n";
+
+	print "NAMES\n";
+	#print Dumper( \%NAMES);
+	print "IPS\n";
+	#print Dumper( \%IPS );
+	print "QUERYS\n";
+	#print Dumper( \%QUERYS );	
+	SaveNames();  
+}
+
+# this is the main public function hat resolves name. 
+sub  ResolveIP{ 
+	my ( $ip ) = @_;
+	if ( exists $NAMES{$ip} ) {
+		$NAMES{$ip}{cnt} ++; 
+		$NAMES{$ip}{at} = scalar time;
+		return $NAMES{$ip}{name}
+	}
+	else {
+		return $ip;
+	}
+}
+
+
+sub SaveNames {
+	# this dumps the hash to a file so that if we have to restart we dont loose all the names
+	# that we have already collected 
+
+	# an the output file for  the MRTG scripts to look at 
+	open NAMEFILE, ">", $namefile or die "Error opening to write $namefile: $!";
+	foreach my $ip ( sort keys %NAMES) {
+		print NAMEFILE $ip, ":	";
+		print NAMEFILE $NAMES{$ip}{at}, ":	";
+		print NAMEFILE $NAMES{$ip}{from}, ":	" ;
+		print NAMEFILE $NAMES{$ip}{cnt}, ":	" ;
+		print NAMEFILE $NAMES{$ip}{name}, ":\n";
+	}
+	close NAMEFILE;
+}
+
+
+
+sub Reload { 
+# If we have restarted then this can be used to reload the the name resolve cache 
+	
+    if ( -e $namefile ) { 
+		open NAMEFILE, "<", $namefile or die "Error opening for read $namefile: $!";
+		while (<NAMEFILE> ) {
+			#print $_; 
+			chomp;
+			#     1      : \s+  2        : \s+     3      : \s+ 4: \s+  5                     :
+			# 96.8.93.200:     1392253816:     192.168.2.5:    27:     tessera.intellicast.com:
+			#       1       2       3       4      5 
+			if ( /(.*):\s+(.*):\s+(.*):\s+(.*):\s+(.*):.*/ ) {
+				#print "$1: $2: $3: $4: $5:\n";
+				my $ip = $1;
+				$NAMES{$ip}{at}   = $2;
+				$NAMES{$ip}{from} = $3;
+				$NAMES{$ip}{cnt}  = $4;
+				$NAMES{$ip}{name} = $5; 
+				# update the forward map
+				$IPS{ $NAMES{$ip}{name} } = $ip;
+			}
+			else {
+				print DBGFILE "Error unexpected line in resolve cache $_";
+			}
+		}
+	}
+	else { 
+		print "Missing $namefile.. skipping reload \n";
+	}
+	close NAMEFILE;	
+}
+
+
+
+sub Prune1 {
+# An entry is pruned if it has not been accessed more frequently than 
+# once every 12 hours. For example sites that are not accessed once in 12 or 
+# 2 times in 24 hour or 3 times in 36 hours are deleted.
+	
+	foreach my $ip ( keys %NAMES) {
+		# in testing the file may have been touched 
+		my $sec_since_touched = abs ($timestamp - $NAMES{$ip}{at} ) ; 
+		my $threshold = int ($sec_since_touched / $pruneconst );
+
+		if ( $NAMES{$ip}{cnt} <= $threshold ) { 
+			# delete this one
+			print DBGFILE "Prune $ip last touched:", scalar localtime( $NAMES{$ip}{at} ), "\n"; 
+			#print  " Accesed: ", $NAMES{$ip}{cnt} , " LE Threshold: $threshold -- remove \n";
+			delete $NAMES{$ip};
+		}
+		else { 
+			#print  " Accesed:", $NAMES{$ip}{cnt} , " GT Threshold: $threshold -- keep \n";
+		}
+	}
+}
+sub Prune {
+# An entry is pruned if it has not been accessed more frequently than 
+# once every 12 hours. For example sites that are not accessed once in 12 or 
+# 2 times in 24 hour or 3 times in 36 hours are deleted.
+	
+	foreach my $ip ( keys %NAMES) {
+		# in testing the file may have been touched 
+		my $sec_since_touched = abs ($timestamp - $NAMES{$ip}{at} ) ; 
+		my $threshold = int ($sec_since_touched / $pruneconst );
+
+		if ( $NAMES{$ip}{cnt} <= $threshold ) { 
+			# delete this one
+			print DBGFILE "Prune $ip last touched:", scalar localtime( $NAMES{$ip}{at} ), "\n"; 
+			#print  " Accesed: ", $NAMES{$ip}{cnt} , " LE Threshold: $threshold -- remove \n";
+			delete $NAMES{$ip};
+		}
+		# DHCP leases are set to 1 hour on the router 
+		elsif($NAMES{$ip}{from} eq "DHCP" && $sec_since_touched > 7200 ){
+			print DBGFILE "Prune DHCP $ip last touched:", scalar localtime( $NAMES{$ip}{at} ), "\n"; 
+			delete $NAMES{$ip};
+		};
+		#print  " Accesed:", $NAMES{$ip}{cnt} , " GT Threshold: $threshold -- keep \n";
+		
+	}
+}
+
+
+sub test {
+	# get the list of queries and the IPS for them and look them up with the lookup funciton 
+	
+	foreach my $query ( sort keys %QUERYS) {
+		print "Query: $query ";
+		# make sure that we got a valid response from the dig 
+		# and convert the name to a IP ... if possible 
+	    if (exists $IPS{$query} ){  
+			my $ip = $IPS{$query}; 
+			print " to $ip -> ";
+			print ResolveIP( $ip ), "\n"; 
+		}
+		else {
+			print "no Dig responce \n";
+		}
+	}
+	print "savenames\n";
+	#prune DNS every hour for stale entries  
+    if ( (localtime)[1] != 00 ){
+		print "time to prune\n";
+		Prune();
+		# if we ran a prune then save the clean-uped cache 
+		SaveNames ();
+	}
+	else {
+		print "NOT time to prune\n";
+	}
+	
+	
+}
+1;
+
