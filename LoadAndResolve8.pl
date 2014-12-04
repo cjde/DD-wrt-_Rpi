@@ -335,7 +335,7 @@ sub  LoadNames{
 			elsif ( $line =~ /NXDOMAIN-IPv4|NODATA-IPv4|NODATA-IPv6/ ) {
 				print DBGFILE  "In reply found NXDOMAIN-IPv4|NODATA-IPv4|NODATA-IPv6 \n";
 			}
-			else 
+			else {
 				print DBGFILE  "In reply cant find a  IP address -> $line\n";
 				#print "In reply cant find a 1: $thing1 2: $thing2 IP address \n -> $line\n";
 			}
