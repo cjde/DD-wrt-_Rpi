@@ -332,7 +332,10 @@ sub  LoadNames{
 				# deleting the hash entry. But instead we will look for the queried name AFTER
 				# we have saved all the query and can match them up with all the replies 
 			}
-			else {
+			elsif ( $line =~ /NXDOMAIN-IPv4|NODATA-IPv4|NODATA-IPv6/ ) {
+				print DBGFILE  "In reply found NXDOMAIN-IPv4|NODATA-IPv4|NODATA-IPv6 \n";
+			}
+			else 
 				print DBGFILE  "In reply cant find a  IP address -> $line\n";
 				#print "In reply cant find a 1: $thing1 2: $thing2 IP address \n -> $line\n";
 			}
