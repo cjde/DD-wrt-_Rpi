@@ -1,5 +1,16 @@
 #!/usr/bin/perl
 # version 4 
+#---------------------------------------------------------------------------------------------
+# This script reads the uploaded ipconntrack from the dd-wrt router and collapses multiple connections 
+# (one internal host, to multiple ports of the same destination host. AS it does this it accumulates 
+# the origin and reply byte counts to measure the total amount of outbound and inbound traffic for 
+# that internal /external sessions. Once all the traffic has been counted to a specific destination 
+# all the destination traffic is condensed to represent the total in/out traffic from the internal host. 
+#
+# Mod
+# 12/26/14 - added logic that recognizes inbound connections and attributed it to the correct 
+#            internal host instead of the  WAN IP
+#
 use strict;
 use warnings;
 use Data::Dumper;
@@ -138,19 +149,23 @@ while (1) {
 				#print "origin_packet, origin_bytes, src_reply, des_reply, src_port_reply, des_port_reply, reply_packet, reply_bytes\n";
 				#print "$origin_packet, $origin_bytes, $src_reply, $des_reply, $src_port_reply, $des_port_reply, $reply_packet, $reply_bytes\n";
 				
-				# It appears that if a connection is originated ecternally then the internal address is the router address instead of tha actual 
-				# IP of the internal device. So if destination IP is the router we switch the source and destination around so that it looks like
-				# it  originated from the internal device. That way we can account for it.
+				# It appears that if a connection is originated externally then the internal address is the router address instead of the actual 
+				# IP of the internal device.
+				# So if destination IP is the router we switch the source and destination around so that it looks like
+				# it  originated from the internal device. That way we can account for it. 
+				# This is src_reply, des_reply instead of src_origin,  des_origin
 				
 				#tcp      6 50 TIME_WAIT src=74.86.158.107 dst=192.168.1.200 sport=13967 dport=80 packets=5 bytes=526 src=192.168.2.30 dst=74.86.158.107 sport=80 dport=13967 packets=5 bytes=495 [ASSURED] mark=1341440 use=2
+				# tcp      6 78 TIME_WAIT src=74.86.158.109 dst=192.168.1.200 sport=45318 dport=80 packets=9 bytes=675 src=192.168.2.30 dst=74.86.158.109 sport=80 dport=45318 packets=12 bytes=13224 [ASSURED] mark=0 use=2
+				
 				if ( $des_origin eq $WAN_ADDR) {
 					$state = $tcp_state;
-					$desip = $src_origin;
-					$srcip = $des_origin;
-					$dport = $src_port_origin;
-					$sport = $des_port_origin;
-					$rbytes= $origin_bytes;
-					$obytes= $reply_bytes;
+					$srcip = $src_reply;
+					$desip = $des_reply;
+					$dport = $src_port_reply;
+					$sport = $des_port_reply;
+					$rbytes= $reply_bytes;
+					$obytes= $origin_bytes;
 					}
 				else {
 					$state = $tcp_state;
@@ -169,7 +184,7 @@ while (1) {
 				# is still open with the same value time after time... 
  				# instead of saving the raw value we are calculatin the difference, 
  
-				# if we have already collected ths session then compute the difference in bytes that have been observed  
+				# if we have already collected this session then compute the difference in bytes that have been observed  
 				if ( exists $sessions{ $srcip }{ $desip }{"$sport:$dport"}{time}) {
 					my $o_T_bytes = $sessions{ $srcip }{ $desip }{"$sport:$dport"}{o_T_bytes};
 					my $r_T_bytes = $sessions{ $srcip }{ $desip }{"$sport:$dport"}{r_T_bytes};
@@ -228,7 +243,7 @@ while (1) {
 				my $desname = ResolveIP($desip); 
 				#print " $srcname connected to $desname \n";
 				
-				# for evey session of this destination accumulate the Delta origin and reply bytes
+				# for every session of this destination accumulate the Delta origin and reply bytes
 				# this is made up of two parts, the delta for the closed sessions ( which need to be removed ) 
 				# PLUS the delta of the active sessions
 				$sessions{ $srcip }{ $desip }{o_delta} = 0;
