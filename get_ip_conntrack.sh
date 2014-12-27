@@ -1,4 +1,4 @@
-#!/bin/sh -x 
+#!/bin/sh  
 # This script pulls the ip_conntrack from the router no more than once a minute.
 # it checks the creation time on the file and if it was made in the last minute then it does not 
 # get it again. It builds the /tmp/ipconntrack.out which contains the summary of the connections both

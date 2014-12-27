@@ -1,0 +1,64 @@
+#!/bin/sh
+# This script pulls the ip_conntrack from the router no more than one a minute.
+# it checks the creation tim on the file and if it was made in the last minute then it does not 
+# get it again.
+
+RTR=192.168.2.99
+NET=192.168.2 
+CONTRACK_TMP=/tmp/ipconntrack.tmp 
+CONTRACK_RAW=/tmp/ipconntrack.raw 
+CONTRACK_COOKED=/tmp/ipconntrack.out 
+
+# get the current time so we can get the file if it is older than a minute 
+now=`date +%b%d_%H%M` 
+
+# make sure the file is there otherwize you cant check the date! 
+if [ ! -e $CONTRACK_RAW ] 
+then
+   lastcreate="firstime"
+else 
+   lastcreate=`ls -l --time-style=+%b%d_%H%M $CONTRACK_RAW | awk '{ print $6}'`
+fi 
+
+if [ $now != $lastcreate ]
+then 
+    if [ -f /tmp/getit.lock ] 
+    then 
+       # already getting it! just wait for it to finish 
+       sleep 10 
+    else 
+       echo $$ $now >> /tmp/getit.lock 
+       # Go get the file ( scp does not work !!) 
+       ssh -q root@$RTR cat /proc/net/ip_conntrack > $CONTRACK_TMP 
+       echo "called from $0 "    >> $CONTRACK_TMP
+       date    >> $CONTRACK_TMP
+       echo "this proc: $$" >> /tmp/procs
+       ps -ef | grep get_ip_conntrack.sh >> /tmp/procs
+       rm /tmp/getit.lock  
+       mv  $CONTRACK_TMP $CONTRACK_RAW 
+    fi 
+
+    # now that the file is here, we can process it into the number of ASSURED or Stale ( not ASSURED )
+    stale=`grep $NET $CONTRACK_RAW | grep -v ASSURED |wc -l`
+    grep $NET $CONTRACK_RAW | \
+       grep -e ASSURED |\
+       wc -l | \
+       sed -e "s/^/Connections /" -e "s/$/ $stale/" > $CONTRACK_COOKED
+
+    # this needs to better parse the last octet of the ipaddress so that we can use it as an indes into the arrays 
+    # and the subnet needs to be passwd to the awk script so that it can be generalized 
+    # better yet redo in PERL! 
+    
+    grep $NET $CONTRACK_RAW | \
+       awk '\
+       BEGIN {max=30; for (x = 1; x <= max; x++){ active[x]=0; stale[x]=0} }
+       $5 ~ /src=/{host=substr($5,5,25)};
+       $4 ~ /src=/{host=substr($4,5,25)};
+       {i=substr(host,11,20)};
+       /ASSURED/{active[i]=active[i]+1};
+       $0 !~/ASSURED/{stale[i]=stale[i]+1};
+       END { for (x = 1; x <= max; x++) print "192.168.2." x, active[x], stale[x]}
+       ' >> $CONTRACK_COOKED
+
+fi 
+
